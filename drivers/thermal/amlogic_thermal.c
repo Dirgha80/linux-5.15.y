@@ -22,13 +22,10 @@
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/thermal.h>
 
-#include "thermal_core.h"
 #include "thermal_hwmon.h"
 
 #define TSENSOR_CFG_REG1			0x4
@@ -100,12 +97,11 @@ struct amlogic_thermal {
 	const struct amlogic_thermal_data *data;
 	struct regmap *regmap;
 	struct regmap *sec_ao_map;
+	void __iomem *trim_info_reg;
 	struct clk *clk;
 	struct thermal_zone_device *tzd;
 	u32 trim_info;
 };
-
-static struct amlogic_thermal *amlogic_thermal_data_ptr;
 
 /*
  * Calculate a temperature value from a temperature code.
@@ -143,8 +139,11 @@ static int amlogic_thermal_initialize(struct amlogic_thermal *pdata)
 	int ret = 0;
 	int ver;
 
-	regmap_read(pdata->sec_ao_map, pdata->data->u_efuse_off,
-		    &pdata->trim_info);
+	if (!IS_ERR(pdata->trim_info_reg))
+		pdata->trim_info = readl(pdata->trim_info_reg);
+	else
+		regmap_read(pdata->sec_ao_map, pdata->data->u_efuse_off,
+			    &pdata->trim_info);
 
 	ver = TSENSOR_TRIM_VERSION(pdata->trim_info);
 
@@ -181,12 +180,12 @@ static int amlogic_thermal_disable(struct amlogic_thermal *data)
 	return 0;
 }
 
-static int amlogic_thermal_get_temp(void *data, int *temp)
+static int amlogic_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
 {
 	unsigned int tval;
-	struct amlogic_thermal *pdata = data;
+	struct amlogic_thermal *pdata = thermal_zone_device_priv(tz);
 
-	if (!data)
+	if (!pdata)
 		return -EINVAL;
 
 	regmap_read(pdata->regmap, TSENSOR_STAT0, &tval);
@@ -197,22 +196,7 @@ static int amlogic_thermal_get_temp(void *data, int *temp)
 	return 0;
 }
 
-int meson_g12_get_temperature(void)
-{
-	int temp;
-	int ret;
-
-	ret = amlogic_thermal_get_temp(amlogic_thermal_data_ptr, &temp);
-	if (ret) {
-		printk("amlogic_thermal_get_temp() failed!\n");
-		return ret;
-	}
-
-	return temp / 1000;
-}
-EXPORT_SYMBOL(meson_g12_get_temperature);
-
-static const struct thermal_zone_of_device_ops amlogic_thermal_ops = {
+static const struct thermal_zone_device_ops amlogic_thermal_ops = {
 	.get_temp	= amlogic_thermal_get_temp,
 };
 
@@ -266,8 +250,6 @@ static int amlogic_thermal_probe(struct platform_device *pdev)
 	if (!pdata)
 		return -ENOMEM;
 
-	amlogic_thermal_data_ptr = pdata;
-
 	pdata->data = of_device_get_match_data(dev);
 	pdata->pdev = pdev;
 	platform_set_drvdata(pdev, pdata);
@@ -282,31 +264,30 @@ static int amlogic_thermal_probe(struct platform_device *pdev)
 		return PTR_ERR(pdata->regmap);
 
 	pdata->clk = devm_clk_get(dev, NULL);
-	if (IS_ERR(pdata->clk)) {
-		if (PTR_ERR(pdata->clk) != -EPROBE_DEFER)
-			dev_err(dev, "failed to get clock\n");
-		return PTR_ERR(pdata->clk);
+	if (IS_ERR(pdata->clk))
+		return dev_err_probe(dev, PTR_ERR(pdata->clk), "failed to get clock\n");
+
+	pdata->trim_info_reg = devm_platform_ioremap_resource(pdev, 1);
+	if (IS_ERR(pdata->trim_info_reg)) {
+		pdata->sec_ao_map = syscon_regmap_lookup_by_phandle
+			(pdev->dev.of_node, "amlogic,ao-secure");
+		if (IS_ERR(pdata->sec_ao_map)) {
+			dev_err(dev, "syscon regmap lookup failed.\n");
+			return PTR_ERR(pdata->sec_ao_map);
+		}
 	}
 
-	pdata->sec_ao_map = syscon_regmap_lookup_by_phandle
-		(pdev->dev.of_node, "amlogic,ao-secure");
-	if (IS_ERR(pdata->sec_ao_map)) {
-		dev_err(dev, "syscon regmap lookup failed.\n");
-		return PTR_ERR(pdata->sec_ao_map);
-	}
-
-	pdata->tzd = devm_thermal_zone_of_sensor_register(&pdev->dev,
-							  0,
-							  pdata,
-							  &amlogic_thermal_ops);
+	pdata->tzd = devm_thermal_of_zone_register(&pdev->dev,
+						   0,
+						   pdata,
+						   &amlogic_thermal_ops);
 	if (IS_ERR(pdata->tzd)) {
 		ret = PTR_ERR(pdata->tzd);
 		dev_err(dev, "Failed to register tsensor: %d\n", ret);
 		return ret;
 	}
 
-	if (devm_thermal_add_hwmon_sysfs(pdata->tzd))
-		dev_warn(&pdev->dev, "Failed to add hwmon sysfs attributes\n");
+	devm_thermal_add_hwmon_sysfs(&pdev->dev, pdata->tzd);
 
 	ret = amlogic_thermal_initialize(pdata);
 	if (ret)
