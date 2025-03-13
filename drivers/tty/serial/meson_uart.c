@@ -81,10 +81,6 @@ static struct uart_driver meson_uart_driver;
 
 static struct uart_port *meson_ports[AML_UART_PORT_NUM];
 
-struct meson_uart_data {
-	bool has_xtal_div2;
-};
-
 static void meson_uart_set_mctrl(struct uart_port *port, unsigned int mctrl)
 {
 }
@@ -162,7 +158,7 @@ static void meson_uart_start_tx(struct uart_port *port)
 
 		ch = xmit->buf[xmit->tail];
 		writel(ch, port->membase + AML_UART_WFIFO);
-		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+		xmit->tail = (xmit->tail+1) & (SERIAL_XMIT_SIZE - 1);
 		port->icount.tx++;
 	}
 
@@ -258,14 +254,6 @@ static const char *meson_uart_type(struct uart_port *port)
 	return (port->type == PORT_MESON) ? "meson_uart" : NULL;
 }
 
-/*
- * This function is called only from probe() using a temporary io mapping
- * in order to perform a reset before setting up the device. Since the
- * temporarily mapped region was successfully requested, there can be no
- * console on this port at this time. Hence it is not necessary for this
- * function to acquire the port->lock. (Since there is no console on this
- * port at this time, the port->lock is not initialized yet.)
- */
 static void meson_uart_reset(struct uart_port *port)
 {
 	u32 val;
@@ -280,11 +268,8 @@ static void meson_uart_reset(struct uart_port *port)
 
 static int meson_uart_startup(struct uart_port *port)
 {
-	unsigned long flags;
 	u32 val;
 	int ret = 0;
-
-	spin_lock_irqsave(&port->lock, flags);
 
 	val = readl(port->membase + AML_UART_CONTROL);
 	val |= AML_UART_CLEAR_ERR;
@@ -301,8 +286,6 @@ static int meson_uart_startup(struct uart_port *port)
 	val = (AML_UART_RECV_IRQ(1) | AML_UART_XMIT_IRQ(port->fifosize / 2));
 	writel(val, port->membase + AML_UART_MISC);
 
-	spin_unlock_irqrestore(&port->lock, flags);
-
 	ret = request_irq(port->irq, meson_uart_interrupt, 0,
 			  port->name, port);
 
@@ -311,23 +294,21 @@ static int meson_uart_startup(struct uart_port *port)
 
 static void meson_uart_change_speed(struct uart_port *port, unsigned long baud)
 {
-	const struct meson_uart_data *private_data = port->private_data;
-	u32 val = 0;
+	u32 val;
 
 	while (!meson_uart_tx_empty(port))
 		cpu_relax();
 
 	if (port->uartclk == 24000000) {
-		unsigned int xtal_div = 3;
-
-		if (private_data && private_data->has_xtal_div2) {
-			xtal_div = 2;
-			val |= AML_UART_BAUD_XTAL_DIV2;
+		if (of_device_is_compatible(port->dev->of_node, "amlogic,meson-gxl-uart")) {
+			val = DIV_ROUND_CLOSEST(port->uartclk, 2 * baud) - 1;
+			val |= AML_UART_BAUD_XTAL | AML_UART_BAUD_XTAL_DIV2;
+		} else {
+			val = DIV_ROUND_CLOSEST(port->uartclk, 3 * baud) - 1;
+			val |= AML_UART_BAUD_XTAL;
 		}
-		val |= DIV_ROUND_CLOSEST(port->uartclk / xtal_div, baud) - 1;
-		val |= AML_UART_BAUD_XTAL;
 	} else {
-		val =  DIV_ROUND_CLOSEST(port->uartclk / 4, baud) - 1;
+		val = DIV_ROUND_CLOSEST(port->uartclk, 4 * baud) - 1;
 	}
 	val |= AML_UART_BAUD_USE;
 	writel(val, port->membase + AML_UART_REG5);
@@ -335,7 +316,7 @@ static void meson_uart_change_speed(struct uart_port *port, unsigned long baud)
 
 static void meson_uart_set_termios(struct uart_port *port,
 				   struct ktermios *termios,
-				   const struct ktermios *old)
+				   struct ktermios *old)
 {
 	unsigned int cflags, iflags, baud;
 	unsigned long flags;
@@ -380,14 +361,10 @@ static void meson_uart_set_termios(struct uart_port *port,
 	else
 		val |= AML_UART_STOP_BIT_1SB;
 
-	if (cflags & CRTSCTS) {
-		if (port->flags & UPF_HARD_FLOW)
-			val &= ~AML_UART_TWO_WIRE_EN;
-		else
-			termios->c_cflag &= ~CRTSCTS;
-	} else {
+	if (cflags & CRTSCTS)
+		val &= ~AML_UART_TWO_WIRE_EN;
+	else
 		val |= AML_UART_TWO_WIRE_EN;
-	}
 
 	writel(val, port->membase + AML_UART_CONTROL);
 
@@ -671,6 +648,29 @@ static struct uart_driver meson_uart_driver = {
 	.cons		= MESON_SERIAL_CONSOLE,
 };
 
+static inline struct clk *meson_uart_probe_clock(struct device *dev,
+						 const char *id)
+{
+	struct clk *clk = NULL;
+	int ret;
+
+	clk = devm_clk_get(dev, id);
+	if (IS_ERR(clk))
+		return clk;
+
+	ret = clk_prepare_enable(clk);
+	if (ret) {
+		dev_err(dev, "couldn't enable clk\n");
+		return ERR_PTR(ret);
+	}
+
+	devm_add_action_or_reset(dev,
+			(void(*)(void *))clk_disable_unprepare,
+			clk);
+
+	return clk;
+}
+
 static int meson_uart_probe_clocks(struct platform_device *pdev,
 				   struct uart_port *port)
 {
@@ -678,15 +678,15 @@ static int meson_uart_probe_clocks(struct platform_device *pdev,
 	struct clk *clk_pclk = NULL;
 	struct clk *clk_baud = NULL;
 
-	clk_pclk = devm_clk_get_enabled(&pdev->dev, "pclk");
+	clk_pclk = meson_uart_probe_clock(&pdev->dev, "pclk");
 	if (IS_ERR(clk_pclk))
 		return PTR_ERR(clk_pclk);
 
-	clk_xtal = devm_clk_get_enabled(&pdev->dev, "xtal");
+	clk_xtal = meson_uart_probe_clock(&pdev->dev, "xtal");
 	if (IS_ERR(clk_xtal))
 		return PTR_ERR(clk_xtal);
 
-	clk_baud = devm_clk_get_enabled(&pdev->dev, "baud");
+	clk_baud = meson_uart_probe_clock(&pdev->dev, "baud");
 	if (IS_ERR(clk_baud))
 		return PTR_ERR(clk_baud);
 
@@ -702,7 +702,6 @@ static int meson_uart_probe(struct platform_device *pdev)
 	u32 fifosize = 64; /* Default is 64, 128 for EE UART_0 */
 	int ret = 0;
 	int irq;
-	bool has_rtscts;
 
 	if (pdev->dev.of_node)
 		pdev->id = of_alias_get_id(pdev->dev.of_node, "serial");
@@ -730,7 +729,6 @@ static int meson_uart_probe(struct platform_device *pdev)
 		return irq;
 
 	of_property_read_u32(pdev->dev.of_node, "fifo-size", &fifosize);
-	has_rtscts = of_property_read_bool(pdev->dev.of_node, "uart-has-rtscts");
 
 	if (meson_ports[pdev->id]) {
 		dev_err(&pdev->dev, "port %d already allocated\n", pdev->id);
@@ -750,8 +748,6 @@ static int meson_uart_probe(struct platform_device *pdev)
 	port->mapsize = resource_size(res_mem);
 	port->irq = irq;
 	port->flags = UPF_BOOT_AUTOCONF | UPF_LOW_LATENCY;
-	if (has_rtscts)
-		port->flags |= UPF_HARD_FLOW;
 	port->has_sysrq = IS_ENABLED(CONFIG_SERIAL_MESON_CONSOLE);
 	port->dev = &pdev->dev;
 	port->line = pdev->id;
@@ -759,7 +755,6 @@ static int meson_uart_probe(struct platform_device *pdev)
 	port->x_char = 0;
 	port->ops = &meson_uart_ops;
 	port->fifosize = fifosize;
-	port->private_data = (void *)device_get_match_data(&pdev->dev);
 
 	meson_ports[pdev->id] = port;
 	platform_set_drvdata(pdev, port);
@@ -788,20 +783,12 @@ static int meson_uart_remove(struct platform_device *pdev)
 	return 0;
 }
 
-static struct meson_uart_data s4_uart_data = {
-	.has_xtal_div2 = true,
-};
-
 static const struct of_device_id meson_uart_dt_match[] = {
 	{ .compatible = "amlogic,meson6-uart" },
 	{ .compatible = "amlogic,meson8-uart" },
 	{ .compatible = "amlogic,meson8b-uart" },
 	{ .compatible = "amlogic,meson-gx-uart" },
 	{ .compatible = "amlogic,meson-gxl-uart" },
-	{
-		.compatible = "amlogic,meson-s4-uart",
-		.data = (void *)&s4_uart_data,
-	},
 	{ /* sentinel */ },
 };
 MODULE_DEVICE_TABLE(of, meson_uart_dt_match);
