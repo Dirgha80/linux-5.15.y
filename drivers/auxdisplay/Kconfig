@@ -227,6 +227,12 @@ config OPENVFD
 	  backpack.
 
 	    Sources: https://github.com/arthur-liberman/linux_openvfd
+config FD6551
+	tristate "FD6551 driver for LED 7 segment displays"
+	depends on I2C_GPIO
+	depends on OF || COMPILE_TEST
+	help
+	  Say Y to enable support for FD6551
 
 menuconfig PARPORT_PANEL
 	tristate "Parallel port LCD/Keypad Panel support"
