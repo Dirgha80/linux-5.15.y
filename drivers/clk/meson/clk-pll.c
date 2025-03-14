@@ -25,7 +25,7 @@
  *
  * out = in * (m + frac / frac_max) / n
  */
-#include <linux/arm-smccc.h>
+
 #include <linux/clk-provider.h>
 #include <linux/delay.h>
 #include <linux/err.h>
